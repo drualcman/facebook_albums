@@ -46,10 +46,34 @@ var lockObj = new object();
 // --- BOLSA CONCURRENTE PARA RESULTADOS ---
 var resultados = new ConcurrentBag<(string titulo, int imagenes)>();
 
-// --- PARALELO (con límite para evitar sobrecarga de disco) ---
+// --- LÍNEA FIJA PARA PROGRESO ---
+int progressLine = Console.CursorTop;
+Console.WriteLine(); // Dejar una línea vacía para el spinner
+
+// --- ANIMACIÓN EN LÍNEA FIJA ---
+var spinner = new[] { "|", "/", "-", "\\" };
+int spinnerIndex = 0;
+bool isRunning = true;
+
+var progressTask = Task.Run(() =>
+{
+    while (isRunning)
+    {
+        lock (lockObj)
+        {
+            Console.SetCursorPosition(0, progressLine);
+            string status = $"Procesando... {spinner[spinnerIndex]} ({totalProcesados}/{htmlFiles.Count} álbumes, {totalImagenes} imágenes)";
+            Console.Write(status.PadRight(Console.WindowWidth - 1)); // Sobrescribe toda la línea
+        }
+        spinnerIndex = (spinnerIndex + 1) % spinner.Length;
+        Thread.Sleep(200);
+    }
+});
+
+// --- PARALELO ---
 Parallel.ForEach(htmlFiles, new ParallelOptions
 {
-    MaxDegreeOfParallelism = Math.Min(Environment.ProcessorCount, 4) // Limitar a 4 para evitar colisiones de I/O
+    MaxDegreeOfParallelism = Math.Min(Environment.ProcessorCount, 4)
 }, htmlPath =>
 {
     try
@@ -72,11 +96,22 @@ Parallel.ForEach(htmlFiles, new ParallelOptions
         {
             totalErrores++;
         }
-        Console.WriteLine($"[ERROR CRÍTICO] {Path.GetFileName(htmlPath)}: {ex.Message}");
+        // Logs van ABAJO de la línea de progreso
+        Console.SetCursorPosition(0, Console.CursorTop);
+        Console.WriteLine($"[ERROR CRÍTICO] {Path.GetFileName(htmlPath)}: {ex.Message}".PadRight(Console.WindowWidth));
     }
 });
 
-// --- MOSTRAR RESULTADOS ORDENADOS ---
+// --- DETENER ANIMACIÓN ---
+isRunning = false;
+progressTask.Wait(500); // Esperar a que termine
+
+// --- LIMPIAR LÍNEA DE PROGRESO ---
+Console.SetCursorPosition(0, progressLine);
+Console.Write(new string(' ', Console.WindowWidth - 1));
+Console.SetCursorPosition(0, progressLine);
+
+// --- MOSTRAR RESULTADOS ---
 Console.WriteLine(new string('=', 60));
 Console.WriteLine("ÁLBUMES CON IMÁGENES:");
 foreach (var (titulo, img) in resultados.OrderBy(r => r.titulo))
@@ -93,7 +128,7 @@ Console.WriteLine($"Errores encontrados: {totalErrores}");
 Console.WriteLine("\nPresiona cualquier tecla para salir...");
 Console.ReadKey();
 
-// ==================== FUNCIÓN PROCESAR ÁLBUM (MEJORADA) ====================
+// ==================== FUNCIÓN PROCESAR ÁLBUM (sin cambios) ====================
 static (string titulo, int imagenes) ProcesarAlbum(string htmlPath, string albumFolder, string mediaFolder)
 {
     var htmlDoc = new HtmlDocument();
@@ -101,31 +136,26 @@ static (string titulo, int imagenes) ProcesarAlbum(string htmlPath, string album
 
     var titleNode = htmlDoc.DocumentNode.SelectSingleNode("//h1");
     string albumTitle = titleNode?.InnerText.Trim() ?? "Álbum sin título";
-    albumTitle = SanitizeFileName(albumTitle); // Sanitizado MEJORADO
+    albumTitle = SanitizeFileName(albumTitle);
 
     var secciones = htmlDoc.DocumentNode.SelectNodes("//section[contains(@class, '_a6-g')]");
 
-    // TU LÍNEA: ¡PERFECTA!
     if (secciones == null || !secciones.Any())
         return (albumTitle, 0);
 
     string albumOutputFolder = Path.Combine(albumFolder, albumTitle);
 
-    // NUEVO: Verificar/crear carpeta con manejo de errores
     try
     {
         Directory.CreateDirectory(albumOutputFolder);
-
-        // Verificar que se creó correctamente
         if (!Directory.Exists(albumOutputFolder))
-        {
-            throw new DirectoryNotFoundException($"No se pudo crear la carpeta: {albumOutputFolder}");
-        }
+            throw new DirectoryNotFoundException($"No se pudo crear: {albumOutputFolder}");
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"[ERROR CARPETA] No se pudo crear carpeta para '{albumTitle}': {ex.Message}");
-        return (albumTitle, 0); // Saltar álbum entero si falla la carpeta
+        Console.SetCursorPosition(0, Console.CursorTop);
+        Console.WriteLine($"[ERROR CARPETA] '{albumTitle}': {ex.Message}".PadRight(Console.WindowWidth));
+        return (albumTitle, 0);
     }
 
     int index = 1;
@@ -154,7 +184,6 @@ static (string titulo, int imagenes) ProcesarAlbum(string htmlPath, string album
                 continue;
             }
 
-            // Sanitizar NOMBRE DE ARCHIVO también
             string fileName = !string.IsNullOrWhiteSpace(comment)
                 ? SanitizeFileName(comment)
                 : $"{albumTitle} - {index:D3}";
@@ -166,7 +195,6 @@ static (string titulo, int imagenes) ProcesarAlbum(string htmlPath, string album
             string finalName = GetUniqueFileName(albumOutputFolder, fileName, extension);
             string destPath = Path.Combine(albumOutputFolder, finalName);
 
-            // NUEVO: Manejo de errores en copia
             try
             {
                 File.Copy(fullImagePath, destPath, true);
@@ -174,9 +202,9 @@ static (string titulo, int imagenes) ProcesarAlbum(string htmlPath, string album
             }
             catch (Exception copyEx)
             {
-                Console.WriteLine($"[ERROR COPIA] Imagen '{finalName}' en álbum '{albumTitle}': {copyEx.Message}");
+                Console.SetCursorPosition(0, Console.CursorTop);
+                Console.WriteLine($"[ERROR COPIA] '{finalName}' en '{albumTitle}': {copyEx.Message}".PadRight(Console.WindowWidth));
                 imagenesFallidas++;
-                continue; // Continúa con la siguiente imagen
             }
 
             index++;
@@ -184,44 +212,36 @@ static (string titulo, int imagenes) ProcesarAlbum(string htmlPath, string album
         catch (Exception imgEx)
         {
             imagenesFallidas++;
-            Console.WriteLine($"[ERROR IMAGEN] En álbum '{albumTitle}': {imgEx.Message}");
-            continue; // Continúa con la siguiente sección
+            Console.SetCursorPosition(0, Console.CursorTop);
+            Console.WriteLine($"[ERROR IMAGEN] En álbum '{albumTitle}': {imgEx.Message}".PadRight(Console.WindowWidth));
         }
     }
 
-    // Log de fallos por álbum
     if (imagenesFallidas > 0)
     {
-        Console.WriteLine($"[INFO] Álbum '{albumTitle}': {imagenesGuardadas} guardadas, {imagenesFallidas} fallidas");
+        Console.SetCursorPosition(0, Console.CursorTop);
+        Console.WriteLine($"[INFO] Álbum '{albumTitle}': {imagenesGuardadas} guardadas, {imagenesFallidas} fallidas".PadRight(Console.WindowWidth));
     }
 
     return (albumTitle, imagenesGuardadas);
 }
 
-// --- SANITIZE MEJORADO (maneja TODOS los inválidos + ... + espacios múltiples) ---
+// --- SANITIZE MEJORADO ---
 static string SanitizeFileName(string name)
 {
     if (string.IsNullOrWhiteSpace(name))
         return "";
 
-    // Reemplazar puntos suspensivos y otros comunes
-    name = name.Replace("...", "_")
-               .Replace("..", "_")
-               .Replace("...", "_"); // Triple para cubrir casos
-
-    // Eliminar/reemplazar TODOS los caracteres inválidos
-    var invalidChars = Path.GetInvalidFileNameChars().Concat(Path.GetInvalidPathChars())
-                           .Concat(new char[] { '*', '?', '"', '<', '>', '|' }); // Extra precaución
-    name = invalidChars.Aggregate(name, (current, c) => current.Replace(c, '_'));
-
-    // Limpiar espacios múltiples y trim
+    name = name.Replace("...", "_").Replace("..", "_");
+    var invalid = Path.GetInvalidFileNameChars().Concat(Path.GetInvalidPathChars())
+                      .Concat(new[] { '*', '?', '"', '<', '>', '|' });
+    name = invalid.Aggregate(name, (c, ch) => c.Replace(ch, '_'));
     name = Regex.Replace(name, @"\s+", " ").Trim();
 
-    // Limitar longitud
     return name.Length > 180 ? name.Substring(0, 180) : name;
 }
 
-// --- NOMBRE ÚNICO (sin cambios) ---
+// --- NOMBRE ÚNICO ---
 static string GetUniqueFileName(string folder, string baseName, string extension)
 {
     string name = baseName;
